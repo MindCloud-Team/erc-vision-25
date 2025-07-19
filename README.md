@@ -21,7 +21,8 @@ This directory contains Python scripts for performing 2D spatial understanding a
 
    ```
    # On Windows
-   set GOOGLE_API_KEY=your_key_here
+   set GOOGLE_API_KEY=your_key_here # for Command Prompt
+   $env:GOOGLE_API_KEY="your_key_here" # for PowerShell
 
    # On macOS/Linux
    export GOOGLE_API_KEY=your_key_here
