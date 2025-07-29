@@ -4,7 +4,7 @@
 
 This script takes an image path as a command-line argument,
 detects objects in the image using the Gemini API, draws bounding boxes
-around them, and saves the output image to a 'landmarks' directory.
+around them, and asks the user if they want to save the output image.
 
 Usage:
     python LD2.py "path/to/your/image.jpg"
@@ -19,6 +19,8 @@ from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 import google.generativeai as genai
 from google.generativeai import types
+import cv2
+import numpy as np
 
 def parse_json_output(json_output: str):
     """
@@ -28,9 +30,9 @@ def parse_json_output(json_output: str):
         json_output = json_output.split("```json")[1].split("```")[0]
     return json_output
 
-def plot_bounding_boxes(im, bounding_boxes_str, output_path):
+def plot_bounding_boxes(im, bounding_boxes_str):
     """
-    Plots bounding boxes on an image and saves it.
+    Plots bounding boxes on an image and returns the modified image.
     """
     width, height = im.size
     draw = ImageDraw.Draw(im)
@@ -45,7 +47,7 @@ def plot_bounding_boxes(im, bounding_boxes_str, output_path):
     except (json.JSONDecodeError, IndexError) as e:
         print(f"Error parsing bounding box JSON: {e}")
         print(f"Received: {bounding_boxes_str}")
-        return
+        return im
 
     try:
         # Try to use a system font, fallback to default
@@ -72,8 +74,7 @@ def plot_bounding_boxes(im, bounding_boxes_str, output_path):
 
         draw.rectangle(((abs_x1, abs_y1), (abs_x2, abs_y2)), outline=color, width=4)
 
-    im.save(output_path)
-    print(f"Output image saved to: {output_path}")
+    return im
 
 def main(image_path):
     """
@@ -137,16 +138,54 @@ def main(image_path):
         print(f"Error during API call: {e}")
         sys.exit(1)
 
-    # --- Output Handling ---
-    output_dir = "landmarks"
-    os.makedirs(output_dir, exist_ok=True)
+    # --- Process image ---
+    processed_image = plot_bounding_boxes(im.copy(), response.text)
     
-    base_name = os.path.basename(image_path)
-    name, ext = os.path.splitext(base_name)
-    output_filename = f"{name}_landmarks{ext}"
-    output_path = os.path.join(output_dir, output_filename)
+    # Convert PIL image to OpenCV format for display
+    cv_image = cv2.cvtColor(np.array(processed_image), cv2.COLOR_RGB2BGR)
+    
+    # Display image with instructions
+    window_name = "Object Detection Result"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.imshow(window_name, cv_image)
+    
+    # Add text overlay with instructions
+    h, w = cv_image.shape[:2]
+    instruction_img = cv_image.copy()
+    cv2.rectangle(instruction_img, (0, h-40), (w, h), (0, 0, 0), -1)  # Black background
+    cv2.putText(instruction_img, "Press 'y' to save image, 'n' to discard, 'q' to quit", 
+                (10, h-15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.imshow(window_name, instruction_img)
+    
+    # Wait for user input
+    save_image = False
+    while True:
+        key = cv2.waitKey(0) & 0xFF
+        if key == ord('y'):
+            save_image = True
+            break
+        elif key == ord('n') or key == ord('q'):
+            break
+        # Ignore other keys
+    
+    # Close the window
+    cv2.destroyAllWindows()
+    
+    # Save image if requested
+    if save_image:
+        # --- Output Handling ---
+        output_dir = "landmarks"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        base_name = os.path.basename(image_path)
+        name, ext = os.path.splitext(base_name)
+        output_filename = f"{name}_landmarks{ext}"
+        output_path = os.path.join(output_dir, output_filename)
 
-    plot_bounding_boxes(im.copy(), response.text, output_path)
+        processed_image.save(output_path)
+        print(f"Output image saved to: {output_path}")
+    else:
+        print("Image not saved.")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
