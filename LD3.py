@@ -1,36 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-2D spatial understanding in videos with Gemini.
+Real-time 2D spatial understanding with Gemini.
 
-This script takes a video path or camera index as a command-line argument,
-detects objects in the video frames using the Gemini API, draws bounding boxes
-around them, and saves the output video to a 'landmarks' directory.
-
-Usage:
-    python LD3.py "path/to/your/video.mp4"
-    or
-    python LD3.py 0 (for the default camera)
-
-Make sure to set the GOOGLE_API_KEY environment variable before running.
+This script captures live camera feed, detects objects in frames using Gemini API,
+draws bounding boxes around them, and allows user interaction with keyboard:
+- 'k': Save screenshot to saved_frames directory (with bounding boxes)
+- 's': Skip processing current frame
+- 'q': Quit
 """
 
-import sys
 import os
 import json
 import time
-from PIL import Image, ImageDraw, ImageFont, ImageColor
-import google.generativeai as genai
-from google.generativeai import types
 import cv2
 import numpy as np
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from PIL import Image, ImageColor
+import google.generativeai as genai
+from google.generativeai import types
 import threading
+import queue
+import sys
+import signal
+
+# Global shutdown event
+shutdown_event = threading.Event()
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C signal."""
+    print("\nReceived interrupt signal. Shutting down...")
+    shutdown_event.set()
 
 def parse_json_output(json_output: str):
-    """
-    Parses the JSON output from the model, removing markdown fencing.
-    """
+    """Parses JSON output from model, removing markdown fencing."""
     if not json_output:
         return None
     if "```json" in json_output:
@@ -38,15 +40,14 @@ def parse_json_output(json_output: str):
     return json_output
 
 def draw_bounding_boxes_on_frame(frame, bounding_boxes_str):
-    """
-    Draws bounding boxes on an OpenCV frame.
-    """
+    """Draws bounding boxes on OpenCV frame with labels."""
     if not bounding_boxes_str:
         return frame
 
     height, width, _ = frame.shape
     
-    colors = [color for color, code in ImageColor.colormap.items() if color not in ['black', 'white']]
+    colors = [color for color, code in ImageColor.colormap.items() 
+             if color not in ['black', 'white'] and not color.startswith('grey')]
     if not colors:
         colors = ['red', 'green', 'blue', 'yellow', 'purple']
 
@@ -56,40 +57,54 @@ def draw_bounding_boxes_on_frame(frame, bounding_boxes_str):
             return frame
         bounding_boxes = json.loads(bounding_boxes_json)
     except (json.JSONDecodeError, IndexError) as e:
-        print(f"Error parsing bounding box JSON: {e}")
-        print(f"Received: {bounding_boxes_str}")
+        print(f"JSON parse error: {e}")
         return frame
 
     for i, bounding_box in enumerate(bounding_boxes):
+        if i >= len(colors):
+            break
+            
         color_name = colors[i % len(colors)]
-        color_rgb = ImageColor.getrgb(color_name)
-        # Convert RGB to BGR for OpenCV
-        color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
+        try:
+            color_rgb = ImageColor.getrgb(color_name)
+            color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
+        except ValueError:
+            color_bgr = (0, 255, 0)  # Fallback to green
 
         box = bounding_box.get("box_2d")
         if not box or len(box) != 4:
             continue
 
+        # Convert relative coordinates to absolute pixels
         abs_y1 = int(box[0] / 1000 * height)
         abs_x1 = int(box[1] / 1000 * width)
         abs_y2 = int(box[2] / 1000 * height)
         abs_x2 = int(box[3] / 1000 * width)
 
-        if abs_x1 > abs_x2:
-            abs_x1, abs_x2 = abs_x2, abs_x1
-        if abs_y1 > abs_y2:
-            abs_y1, abs_y2 = abs_y2, abs_y1
-
-        cv2.rectangle(frame, (abs_x1, abs_y1), (abs_x2, abs_y2), color_bgr, 4)
+        # Ensure valid coordinates
+        abs_x1, abs_x2 = sorted([abs_x1, abs_x2])
+        abs_y1, abs_y2 = sorted([abs_y1, abs_y2])
+        
+        # Skip invalid boxes
+        if abs_x1 >= abs_x2 or abs_y1 >= abs_y2:
+            continue
+        
+        # Draw rectangle
+        cv2.rectangle(frame, (abs_x1, abs_y1), (abs_x2, abs_y2), color_bgr, 2)
+        
+        # Draw label
+        label = bounding_box.get("object", "object")
+        cv2.putText(frame, label, (abs_x1, abs_y1 - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_bgr, 2)
 
     return frame
 
-def process_frame_in_thread(frame, model, prompt, frame_count, source_name, output_dir, lock, shared_data, video_time_str):
-    """
-    Processes a single frame in a separate thread to detect objects and save ROIs.
-    """
-    print(f"Detecting objects in frame #{frame_count} (Video time: {video_time_str})...")
-
+def process_frame(model, prompt, frame, frame_count, results_queue):
+    """Processes frame to detect objects using Gemini API."""
+    # Check if shutdown was requested
+    if shutdown_event.is_set():
+        return
+        
     # Convert frame for Gemini
     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(img_rgb)
@@ -98,175 +113,179 @@ def process_frame_in_thread(frame, model, prompt, frame_count, source_name, outp
     try:
         response = model.generate_content(
             contents=[prompt, pil_img],
-            generation_config=types.GenerationConfig(
-                temperature=0.5,
-            ),
-            request_options={'timeout': 60.0}
+            generation_config=types.GenerationConfig(temperature=0.5),
+            request_options={'timeout': 5.0}  # Shorter timeout for real-time
         )
         
-        with lock:
-            shared_data['last_bounding_boxes'] = response.text
-        
-        print(f"Object detection complete for frame #{frame_count}.")
-
-        # Save the ROIs as images
-        if response.text:
-            try:
-                bounding_boxes_json = parse_json_output(response.text)
-                if bounding_boxes_json:
-                    bounding_boxes = json.loads(bounding_boxes_json)
-                    height, width, _ = frame.shape
-                    for i, bounding_box in enumerate(bounding_boxes):
-                        box = bounding_box.get("box_2d")
-                        if not box or len(box) != 4:
-                            continue
-
-                        # Calculate absolute coordinates
-                        abs_y1 = int(box[0] / 1000 * height)
-                        abs_x1 = int(box[1] / 1000 * width)
-                        abs_y2 = int(box[2] / 1000 * height)
-                        abs_x2 = int(box[3] / 1000 * width)
-
-                        if abs_x1 > abs_x2:
-                            abs_x1, abs_x2 = abs_x2, abs_x1
-                        if abs_y1 > abs_y2:
-                            abs_y1, abs_y2 = abs_y2, abs_y1
-                        
-                        # Crop the ROI from the original frame
-                        roi = frame[abs_y1:abs_y2, abs_x1:abs_x2]
-
-                        # Save the ROI image
-                        if roi.size > 0:
-                            roi_filename = f"{source_name}_frame_{frame_count}_roi_{i}.png"
-                            roi_path = os.path.join(output_dir, roi_filename)
-                            cv2.imwrite(roi_path, roi)
-                            print(f"ROI for frame {frame_count} saved to {roi_path}")
-
-            except Exception as e:
-                print(f"Could not save ROI for frame {frame_count}: {e}")
-
+        if response.text and not shutdown_event.is_set():
+            results_queue.put((frame_count, response.text))
     except Exception as e:
-        print(f"Error during API call for frame #{frame_count}: {e}")
+        if not shutdown_event.is_set():
+            print(f"API error: {e}")
 
-
-def main(video_source, skip_frames):
-    """
-    Main function to process the video.
-    """
+def main(camera_index=0, skip_frames=20):
+    """Main function to process live camera feed."""
+    # Set up signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+    
     # --- Configuration ---
     GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY')
     if not GOOGLE_API_KEY:
         print("Error: GOOGLE_API_KEY environment variable not set.")
-        sys.exit(1)
+        return
 
-    model_name = "gemini-2.5-flash"
+    model_name = "gemini-1.5-flash"
     prompt = """
     Detect the 2d bounding boxes of the man-made objects and nearby objects only.
-    Ignore objects that are far away or not clearly visible.
-    Ignore rocks, cairn, sand or any natural elements and far objects and any part that can't exist alone.
-    If the object is too close to the camera (not clear and not focused), ignore it.
-    Ignore objects that are part of a larger object. (e.g., a tire is part of a car, ignore the tire)
-    Return the bounding boxes as a JSON array.
+    Return bounding boxes as a JSON array with 'object' label and 'box_2d' in [x1, y1, x2, y2] format.
+    Use relative coordinates (0-1000) for the box positions.
     """
-
-    bounding_box_system_instructions = """
-    Return bounding boxes as a JSON array. Never return masks or code fencing. Limit to 25 objects.
-      """
-
-    safety_settings = [
-        {
-            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-            "threshold": "BLOCK_ONLY_HIGH",
-        },
-    ]
 
     # --- Initialization ---
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
-        model = genai.GenerativeModel(model_name, 
-                                     system_instruction=bounding_box_system_instructions,
-                                     safety_settings=safety_settings)
+        model = genai.GenerativeModel(
+            model_name, 
+            system_instruction="Return bounding boxes as JSON array. Limit to 10 objects."
+        )
     except Exception as e:
-        print(f"Error initializing GenAI client: {e}")
-        sys.exit(1)
+        print(f"GenAI init error: {e}")
+        return
 
-    # --- Video Input Setup ---
-    try:
-        video_source_int = int(video_source)
-        is_camera = True
-        cap = cv2.VideoCapture(video_source_int)
-        source_name = f"camera_{video_source_int}"
-    except ValueError:
-        is_camera = False
-        cap = cv2.VideoCapture(video_source)
-        source_name = os.path.basename(video_source).split('.')[0]
-
+    # --- Camera Setup ---
+    cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        print(f"Error: Could not open video source: {video_source}")
-        sys.exit(1)
+        print(f"Error: Could not open camera index: {camera_index}")
+        return
 
-    # --- Output Video Setup ---
-    output_dir = "landmarks"
+    # Create output directory
+    output_dir = "saved_frames"
     os.makedirs(output_dir, exist_ok=True)
+    print(f"Screenshots will be saved to: {os.path.abspath(output_dir)}")
     
-    
-    # --- Processing Loop ---
-    shared_data = {'last_bounding_boxes': None}
-    lock = threading.Lock()
+    # Create a queue for processing results
+    results_queue = queue.Queue()
+    last_boxes_str = None
+    last_boxes_frame = None
     frame_count = 0
-
-    print("Processing video... This may take a while. Press Ctrl+C to stop.")
+    processing_thread = None
     
-    start_time = time.time()
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        while cap.isOpened():
+    # Try to create GUI window
+    try:
+        cv2.namedWindow("Live Object Detection", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Live Object Detection", 1000, 700)
+        gui_supported = True
+    except cv2.error:
+        print("GUI not supported - running in headless mode")
+        gui_supported = False
+    
+    print("Starting live camera feed...")
+    print("Controls: 'k'=Save screenshot, 's'=Skip frame, 'q'=Quit, 'Ctrl+C'=Force quit")
+    
+    # Main loop
+    try:
+        while not shutdown_event.is_set():
             ret, frame = cap.read()
             if not ret:
+                print("Error reading frame")
                 break
-            
+                
+            display_frame = frame.copy()
             frame_count += 1
             
-            # Get current video time
-            video_timestamp_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            video_time_str = time.strftime('%H:%M:%S', time.gmtime(video_timestamp_ms / 1000))
-
-            # Only call API on the first frame and after skipping 'skip_frames'
-            if (frame_count - 1) % (skip_frames + 1) == 0:
-                # Submit the frame processing to the thread pool
-                executor.submit(process_frame_in_thread, frame.copy(), model, prompt, frame_count, source_name, output_dir, lock, shared_data, video_time_str)
-
-            # Draw boxes on the current frame using most recent detection
-            with lock:
-                current_boxes = shared_data['last_bounding_boxes']
+            # Process frame conditionally
+            if frame_count % (skip_frames + 1) == 0:
+                if processing_thread is None or not processing_thread.is_alive():
+                    processing_thread = threading.Thread(
+                        target=process_frame,
+                        args=(model, prompt, frame.copy(), frame_count, results_queue)
+                    )
+                    processing_thread.daemon = True  # Make thread daemon so it exits with main
+                    processing_thread.start()
             
-            processed_frame = draw_bounding_boxes_on_frame(frame.copy(), current_boxes)
+            # Check for new results
+            while not results_queue.empty():
+                try:
+                    result_frame_count, boxes_str = results_queue.get_nowait()
+                    last_boxes_str = boxes_str
+                    last_boxes_frame = frame.copy()  # Save frame for drawing boxes
+                    print(f"New detection results for frame #{result_frame_count}")
+                except queue.Empty:
+                    break
             
-            # Display the processed frame (Removed due to headless environment incompatibility)
-            # cv2.imshow('Video Object Detection', processed_frame)
+            # Draw bounding boxes if available
+            if last_boxes_str:
+                # Draw boxes on the current display frame
+                display_frame = draw_bounding_boxes_on_frame(display_frame.copy(), last_boxes_str)
             
-            # Video saving is disabled
-            # output_writer.write(processed_frame)
+            # Show frame in GUI if supported
+            if gui_supported:
+                # Add info overlay
+                cv2.putText(display_frame, f"Frame: {frame_count}", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.putText(display_frame, "k:Save  s:Skip  q:Quit", (10, 70), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # Show processing status
+                status = "Processing..." if processing_thread and processing_thread.is_alive() else "Ready"
+                cv2.putText(display_frame, f"Status: {status}", (10, 110), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                
+                # Display frame
+                cv2.imshow("Live Object Detection", display_frame)
             
-            # Check for exit (Removed as it depends on cv2.imshow)
-            # if cv2.waitKey(1) & 0xFF == ord('q'):
-            #     break
-
-    end_time = time.time()
-    total_processing_time = end_time - start_time
-
-    # --- Cleanup ---
-    cap.release()
-    # output_writer.release()  # Video writer is disabled
-    # cv2.destroyAllWindows() # Not needed as no windows are created
-    print("Processing complete!")
-    print(f"Total processing time: {total_processing_time:.2f} seconds.")
+            # Handle key presses with shorter wait time for better responsiveness
+            if gui_supported:
+                key = cv2.waitKey(1) & 0xFF
+            else:
+                # Shorter wait in headless mode for better Ctrl+C response
+                key = cv2.waitKey(1) & 0xFF
+                
+            if key == ord('q'):  # Quit
+                break
+            elif key == ord('k'):  # Save screenshot
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"frame_{timestamp}_{frame_count}.jpg"
+                filepath = os.path.join(output_dir, filename)
+                
+                # Always save with bounding boxes if available
+                if last_boxes_str and last_boxes_frame is not None:
+                    # Create a clean copy of the frame with boxes
+                    save_frame = last_boxes_frame.copy()
+                    save_frame = draw_bounding_boxes_on_frame(save_frame, last_boxes_str)
+                    cv2.imwrite(filepath, save_frame)
+                    print(f"Saved screenshot with boxes: {filepath}")
+                else:
+                    # Save current frame if no boxes available
+                    cv2.imwrite(filepath, frame)
+                    print(f"Saved screenshot without boxes: {filepath}")
+            elif key == ord('s'):  # Skip processing
+                print("Skipping frame processing")
+    
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt received...")
+    finally:
+        # Cleanup
+        shutdown_event.set()
+        cap.release()
+        if gui_supported:
+            cv2.destroyAllWindows()
+        if processing_thread and processing_thread.is_alive():
+            print("Waiting for processing thread to finish...")
+            processing_thread.join(timeout=2.0)  # Wait max 2 seconds
+        print("Application closed")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="2D spatial understanding in videos with Gemini.")
-    parser.add_argument("video_source", help="Path to the video file or camera index (e.g., 0).")
-    parser.add_argument("--skip", type=int, default=29, help="Number of frames to skip between detections. Default is 29 (detect roughly once per second for a 30fps video).")
+    parser = argparse.ArgumentParser(description="Real-time object detection with Gemini.")
+    parser.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
+    parser.add_argument("--skip", type=int, default=20, 
+                       help="Frames to skip between detections (default: 20)")
     
     args = parser.parse_args()
     
-    main(args.video_source, args.skip)
-
+    try:
+        main(camera_index=args.camera, skip_frames=args.skip)
+    except KeyboardInterrupt:
+        print("\nProgram terminated by user")
+    finally:
+        sys.exit(0)
